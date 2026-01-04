@@ -108,6 +108,8 @@ class GeminiClient:
         push_id: str = None,
         model_ids: dict = None,
         debug: bool = False,
+        http_proxy: str = None,  # 新增：HTTP 代理
+        https_proxy: str = None,  # 新增：HTTPS 代理
     ):
         """
         初始化客户端 - 手动填写 token
@@ -122,6 +124,8 @@ class GeminiClient:
             push_id: Push ID for image upload (必填用于图片上传)
             model_ids: 模型 ID 映射 {"flash": "xxx", "pro": "xxx", "thinking": "xxx"}
             debug: 是否打印调试信息
+            http_proxy: HTTP 代理地址 (可选，格式: http://127.0.0.1:7890)
+            https_proxy: HTTPS 代理地址 (可选，格式: http://127.0.0.1:7890)
         """
         self.secure_1psid = secure_1psid
         self.secure_1psidts = secure_1psidts
@@ -162,7 +166,26 @@ class GeminiClient:
             # 如果 SSL 配置失败，使用默认配置
             ssl_context = True
         
-        # 检查环境变量中的代理设置
+        # 配置代理
+        proxies = None
+        if http_proxy or https_proxy:
+            # 优先使用传入的代理参数
+            proxies = {}
+            if http_proxy:
+                proxies["http://"] = http_proxy
+            if https_proxy:
+                proxies["https://"] = https_proxy
+        elif os.environ.get("DISABLE_PROXY") != "1":
+            # 如果没有传入代理，检查环境变量（向后兼容）
+            http_env = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+            https_env = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+            if http_env or https_env:
+                proxies = {}
+                if http_env:
+                    proxies["http://"] = http_env
+                if https_env:
+                    proxies["https://"] = https_env
+        
         # 如果代理有问题，可以通过设置环境变量 DISABLE_PROXY=1 来临时清除代理环境变量
         if os.environ.get("DISABLE_PROXY") == "1":
             # 临时清除代理环境变量（仅对当前进程有效）
@@ -170,6 +193,7 @@ class GeminiClient:
             os.environ.pop("HTTPS_PROXY", None)
             os.environ.pop("http_proxy", None)
             os.environ.pop("https_proxy", None)
+            proxies = None  # 禁用代理
             if self.debug:
                 print("[INFO] 代理已禁用")
         
@@ -180,18 +204,29 @@ class GeminiClient:
             if self.debug:
                 print("[WARNING] SSL 验证已禁用，仅用于测试！")
         
-        self.session = httpx.Client(
-            timeout=1220.0,
-            follow_redirects=True,
-            verify=verify_ssl,
-            headers={
+        # 构建 httpx.Client 的参数
+        client_kwargs = {
+            "timeout": 1220.0,
+            "follow_redirects": True,
+            "verify": verify_ssl,
+            "headers": {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
                 "Origin": self.BASE_URL,
                 "Referer": f"{self.BASE_URL}/",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             },
-        )
+        }
+        
+        # 如果配置了代理，添加到参数中
+        # httpx 使用 proxy 参数（单数），可以传递字符串或字典
+        if proxies:
+            # 优先使用 HTTPS 代理，如果没有则使用 HTTP 代理
+            proxy_url = proxies.get("https://") or proxies.get("http://")
+            if proxy_url:
+                client_kwargs["proxy"] = proxy_url
+        
+        self.session = httpx.Client(**client_kwargs)
         
         # 设置 cookies
         if cookies_str:

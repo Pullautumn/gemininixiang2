@@ -135,6 +135,38 @@
                         </div>
                     </div>
                     
+                    <div class="section">
+                        <div class="section-title">
+                            🌐 代理配置 
+                            <span class="optional">(可选，用于网络请求)</span>
+                        </div>
+                        <div class="info-box">
+                            <strong>说明：</strong>配置本地代理服务器，用于访问 Gemini API。格式：http://127.0.0.1:7890 或 socks5://127.0.0.1:1080
+                        </div>
+                        <div class="form-group">
+                            <label for="HTTP_PROXY">
+                                HTTP 代理
+                            </label>
+                            <input 
+                                type="text" 
+                                name="HTTP_PROXY" 
+                                id="HTTP_PROXY" 
+                                placeholder="http://127.0.0.1:7890"
+                            >
+                        </div>
+                        <div class="form-group">
+                            <label for="HTTPS_PROXY">
+                                HTTPS 代理
+                            </label>
+                            <input 
+                                type="text" 
+                                name="HTTPS_PROXY" 
+                                id="HTTPS_PROXY" 
+                                placeholder="http://127.0.0.1:7890"
+                            >
+                        </div>
+                    </div>
+                    
                     <button type="submit" class="btn btn-primary">💾 保存配置</button>
                 </form>
                 

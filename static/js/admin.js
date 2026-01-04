@@ -61,6 +61,14 @@ function initializeConfig() {
                 document.getElementById('MODEL_ID_PRO').value = config.MODEL_IDS.pro || '';
                 document.getElementById('MODEL_ID_THINKING').value = config.MODEL_IDS.thinking || '';
             }
+            
+            // 加载代理配置
+            if (config.HTTP_PROXY) {
+                document.getElementById('HTTP_PROXY').value = config.HTTP_PROXY;
+            }
+            if (config.HTTPS_PROXY) {
+                document.getElementById('HTTPS_PROXY').value = config.HTTPS_PROXY;
+            }
         })
         .catch(err => {
             console.log('加载配置失败:', err);
@@ -227,6 +235,10 @@ function initializeForm() {
         delete data.MODEL_ID_FLASH;
         delete data.MODEL_ID_PRO;
         delete data.MODEL_ID_THINKING;
+        
+        // 保存代理配置（如果为空则保存空字符串）
+        if (!data.HTTP_PROXY) data.HTTP_PROXY = '';
+        if (!data.HTTPS_PROXY) data.HTTPS_PROXY = '';
         
         const statusEl = document.getElementById('status');
         const submitBtn = configForm.querySelector('button[type="submit"]');

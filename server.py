@@ -104,6 +104,8 @@ _config = {
     "MANUAL_PUSH_ID": "",  # 手动输入的 PUSH_ID（用于保存用户输入）
     "MODELS": DEFAULT_MODELS.copy(),  # 可用模型列表
     "MODEL_IDS": DEFAULT_MODEL_IDS.copy(),  # 模型 ID 映射
+    "HTTP_PROXY": "",  # HTTP 代理
+    "HTTPS_PROXY": "",  # HTTPS 代理
 }
 
 # Cookie 字段映射 (浏览器cookie名 -> 配置字段名)
@@ -149,23 +151,50 @@ def fetch_tokens_from_page(cookies_str: str) -> dict:
         if os.environ.get("DISABLE_SSL_VERIFY") == "1":
             verify_ssl = False
         
-        # 如果代理有问题，可以通过设置环境变量 DISABLE_PROXY=1 来临时清除代理环境变量
-        if os.environ.get("DISABLE_PROXY") == "1":
-            os.environ.pop("HTTP_PROXY", None)
-            os.environ.pop("HTTPS_PROXY", None)
-            os.environ.pop("http_proxy", None)
-            os.environ.pop("https_proxy", None)
+        # 获取配置的代理设置
+        proxies = None
+        http_proxy = _config.get("HTTP_PROXY", "").strip()
+        https_proxy = _config.get("HTTPS_PROXY", "").strip()
         
-        session = httpx.Client(
-            timeout=30.0,
-            follow_redirects=True,
-            verify=verify_ssl,
-            headers={
+        if http_proxy or https_proxy:
+            proxies = {}
+            if http_proxy:
+                proxies["http://"] = http_proxy
+            if https_proxy:
+                proxies["https://"] = https_proxy
+        else:
+            # 如果没有配置代理，检查环境变量（向后兼容）
+            if os.environ.get("DISABLE_PROXY") != "1":
+                http_env = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+                https_env = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+                if http_env or https_env:
+                    proxies = {}
+                    if http_env:
+                        proxies["http://"] = http_env
+                    if https_env:
+                        proxies["https://"] = https_env
+        
+        # 构建 httpx.Client 的参数
+        client_kwargs = {
+            "timeout": 30.0,
+            "follow_redirects": True,
+            "verify": verify_ssl,
+            "headers": {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             }
-        )
+        }
+        
+        # 如果配置了代理，添加到参数中
+        # httpx 使用 proxy 参数（单数），可以传递字符串或字典
+        if proxies:
+            # 优先使用 HTTPS 代理，如果没有则使用 HTTP 代理
+            proxy_url = proxies.get("https://") or proxies.get("http://")
+            if proxy_url:
+                client_kwargs["proxy"] = proxy_url
+        
+        session = httpx.Client(**client_kwargs)
         
         # 设置 cookies
         cookie_count = 0
@@ -417,9 +446,35 @@ def load_config():
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
                 if saved.get("SNLM0E") and saved.get("SECURE_1PSID"):
-                    _config.update(saved)
+                    # 只更新允许的配置字段，避免意外添加其他键
+                    allowed_keys = [
+                        "SNLM0E", "SECURE_1PSID", "SECURE_1PSIDTS", "SAPISID", 
+                        "SID", "HSID", "SSID", "APISID", "PUSH_ID", "FULL_COOKIE",
+                        "MANUAL_SNLM0E", "MANUAL_PUSH_ID", "MODELS", "MODEL_IDS",
+                        "HTTP_PROXY", "HTTPS_PROXY"
+                    ]
+                    for key in allowed_keys:
+                        if key in saved:
+                            if key == "MODEL_IDS":
+                                # 特殊处理 MODEL_IDS，确保是字典类型
+                                if isinstance(saved[key], dict):
+                                    _config[key] = saved[key].copy()
+                                else:
+                                    _config[key] = DEFAULT_MODEL_IDS.copy()
+                            elif key == "MODELS":
+                                # 确保 MODELS 是列表
+                                if isinstance(saved[key], list):
+                                    _config[key] = saved[key].copy()
+                                else:
+                                    _config[key] = DEFAULT_MODELS.copy()
+                            else:
+                                _config[key] = saved[key]
+                    # 确保 MODEL_IDS 存在且是字典
+                    if "MODEL_IDS" not in _config or not isinstance(_config.get("MODEL_IDS"), dict):
+                        _config["MODEL_IDS"] = DEFAULT_MODEL_IDS.copy()
                     loaded_from_json = True
-        except:
+        except Exception as e:
+            print(f"[WARNING] 加载配置失败: {e}")
             pass
     
     # 如果 JSON 没有有效配置，尝试从 config.py 加载
@@ -463,13 +518,40 @@ def get_client():
         cookies += f"; APISID={_config['APISID']}"
     
     from client import GeminiClient
+    # 确保 model_ids 是字典类型，并创建副本避免修改原始配置
+    model_ids_raw = _config.get("MODEL_IDS")
+    if not isinstance(model_ids_raw, dict):
+        model_ids = DEFAULT_MODEL_IDS.copy()
+    else:
+        # 创建副本，避免修改原始配置，并确保只包含有效的键
+        model_ids = {
+            "flash": model_ids_raw.get("flash", DEFAULT_MODEL_IDS["flash"]),
+            "pro": model_ids_raw.get("pro", DEFAULT_MODEL_IDS["pro"]),
+            "thinking": model_ids_raw.get("thinking", DEFAULT_MODEL_IDS["thinking"])
+        }
+    
+    # 确保代理配置是字符串类型
+    http_proxy = _config.get("HTTP_PROXY")
+    if http_proxy and not isinstance(http_proxy, str):
+        http_proxy = None
+    elif http_proxy:
+        http_proxy = http_proxy.strip() or None
+    
+    https_proxy = _config.get("HTTPS_PROXY")
+    if https_proxy and not isinstance(https_proxy, str):
+        https_proxy = None
+    elif https_proxy:
+        https_proxy = https_proxy.strip() or None
+    
     _client = GeminiClient(
         secure_1psid=_config["SECURE_1PSID"],
         snlm0e=_config["SNLM0E"],
         cookies_str=cookies,
         push_id=_config.get("PUSH_ID") or None,
-        model_ids=_config.get("MODEL_IDS") or DEFAULT_MODEL_IDS,
+        model_ids=model_ids,  # 传递字典，不是解包
         debug=False,
+        http_proxy=http_proxy,  # 传递代理配置
+        https_proxy=https_proxy,  # 传递代理配置
     )
     return _client
 
@@ -642,14 +724,24 @@ async def admin_save(request: Request):
     
     # 处理模型 ID 配置
     model_ids = data.get("MODEL_IDS", {})
-    if model_ids:
-        # 只更新非空的值
+    if model_ids and isinstance(model_ids, dict):
+        # 确保 _config["MODEL_IDS"] 是字典
+        if not isinstance(_config.get("MODEL_IDS"), dict):
+            _config["MODEL_IDS"] = DEFAULT_MODEL_IDS.copy()
+        # 只更新非空的值，确保不会覆盖整个字典
         if model_ids.get("flash"):
             _config["MODEL_IDS"]["flash"] = model_ids["flash"]
         if model_ids.get("pro"):
             _config["MODEL_IDS"]["pro"] = model_ids["pro"]
         if model_ids.get("thinking"):
             _config["MODEL_IDS"]["thinking"] = model_ids["thinking"]
+    # 如果 MODEL_IDS 不存在或不是字典，确保使用默认值
+    if not isinstance(_config.get("MODEL_IDS"), dict):
+        _config["MODEL_IDS"] = DEFAULT_MODEL_IDS.copy()
+    
+    # 保存代理配置
+    _config["HTTP_PROXY"] = data.get("HTTP_PROXY", "").strip()
+    _config["HTTPS_PROXY"] = data.get("HTTPS_PROXY", "").strip()
     
     save_config()
     _client = None
