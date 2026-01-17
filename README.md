@@ -18,27 +18,7 @@
 
 ## 📝 更新日志
 
-### v1.3.0 (2026-01-04)
-- 🎨 **全新现代化前端设计**
-  - 重构前端架构，HTML/CSS/JS 文件完全分离
-  - 采用现代化设计系统，包含 CSS 变量、渐变背景、动画效果
-  - 优化用户体验，添加加载状态、错误提示、成功反馈
-  - 响应式设计，完美适配移动端和桌面端
-- 🐛 修复页面滚动问题
-  - 移除阻止页面滚动的 CSS 样式
-  - 优化背景动画，不影响页面交互
-- 💾 修复数据持久化问题
-  - 手动输入的 AT Token 和 PUSH_ID 现在会正确保存
-  - 刷新页面后手动输入的数据会保留显示
-- 🖼️ 修复示例图片显示问题
-  - 示例图片现在可以正常显示
-  - 支持点击放大查看
-- 📁 优化项目结构
-  - 创建 `templates/` 目录存放 HTML 模板
-  - 创建 `static/css/` 和 `static/js/` 目录存放静态资源
-  - 代码组织更清晰，便于维护和扩展
-
-### v1.2.0 (2026-01-01)
+### v1.3.0 (2026-01-01)
 - 🔧 改进 AT Token 自动获取功能
   - 增加更多匹配模式（从 3 种增加到 8 种）
   - 添加详细的错误诊断信息
@@ -59,7 +39,21 @@
   - 修复 httpx.Client 的 proxies 参数问题
 - ⚙️ 更改默认端口
   - 将默认端口从 8000 改为 23456（更不常见的端口）
-
+### v1.2.0 (2026-01-04)
+- 🆕 新增图片生成支持
+  - AI 生成的图片自动下载到本地并通过代理返回
+  - 自动获取高清无水印原图
+  - 过滤用户上传的图片，只返回 AI 生成的内容
+- 🆕 新增视频生成提示
+  - 视频为异步生成，返回友好提示，引导用户到官网查看
+  - 显示使用限制说明
+- 🔧 优化图片处理
+  - 修复图片重复下载问题
+  - 修复图片理解时返回上传图片 URL 的问题
+  - 清理响应中的占位符 URL
+- 📝 使用限制说明（官网限制）
+  - 视频生成（Veo 模型）：每天总共可以生成 3 次
+  - 图片生成（Nano Banana 模型）：每天总共可以生成 1000 次
 ### v1.1.0 (2025-12-26)
 - 🆕 新增 Tools / Function Calling 支持
   - 支持 OpenAI 格式的 tools 参数
@@ -204,7 +198,7 @@ response = client.chat.completions.create(
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:23456/v1", api_key="sk-gemini")
+client = OpenAI(base_url="http://localhost:23456/v1", api_key="sk-geminixxxxx")
 
 messages = []
 
@@ -230,7 +224,7 @@ print(f"助手: {response.choices[0].message.content}")
 import base64
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:23456/v1", api_key="sk-gemini")
+client = OpenAI(base_url="http://localhost:23456/v1", api_key="sk-geminixxxxx")
 
 # 读取本地图片（使用项目中的 image.png 示例图片）
 with open("image.png", "rb") as f:
@@ -269,7 +263,7 @@ response = client.chat.completions.create(
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:23456/v1", api_key="sk-gemini")
+client = OpenAI(base_url="http://localhost:23456/v1", api_key="sk-geminixxxxx")
 
 stream = client.chat.completions.create(
     model="gemini-3.0-flash",
@@ -289,7 +283,7 @@ for chunk in stream:
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:23456/v1", api_key="sk-gemini")
+client = OpenAI(base_url="http://localhost:23456/v1", api_key="sk-geminixxxxx")
 
 # 定义工具
 tools = [
@@ -394,7 +388,7 @@ PORT = 23456
 配置 OpenAI 兼容的 AI 插件：
 
 - Base URL: `http://localhost:23456/v1`
-- API Key: `sk-gemini`
+- API Key: `sk-geminixxxxx`
 - Model: `gemini-3.0-flash`
 
 ### Q: 多轮对话上下文丢失？

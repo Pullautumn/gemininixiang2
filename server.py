@@ -41,28 +41,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 静态文件路由 (CSS, JS, 图片等)
+# 静态文件路由 (用于示例图片)
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 
-# 挂载静态文件目录
-if os.path.exists("static"):
-    app.mount("/static", StaticFiles(directory="static"), name="static")
+# 生成的媒体文件缓存目录
+MEDIA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "media_cache")
+os.makedirs(MEDIA_CACHE_DIR, exist_ok=True)
 
-# 提供根目录的 image.png 文件（兼容旧路径）
-@app.get("/static/image.png")
-async def serve_image():
-    """提供示例图片"""
-    # 优先从 static 目录查找
-    static_path = os.path.join(os.path.dirname(__file__), "static", "image.png")
-    root_path = os.path.join(os.path.dirname(__file__), "image.png")
+@app.get("/static/{filename}")
+async def serve_static(filename: str):
+    """提供静态文件（示例图片等）"""
+    file_path = os.path.join(os.path.dirname(__file__), filename)
+    if os.path.exists(file_path):
+        return FileResponse(file_path)
+    raise HTTPException(status_code=404, detail="文件不存在")
+
+@app.get("/media/{media_id}")
+async def serve_media(media_id: str):
+    """提供缓存的媒体文件"""
+    # 安全检查：只允许字母数字和下划线
+    if not media_id.replace("_", "").replace("-", "").isalnum():
+        raise HTTPException(status_code=400, detail="无效的媒体 ID")
     
-    if os.path.exists(static_path):
-        return FileResponse(static_path)
-    elif os.path.exists(root_path):
-        return FileResponse(root_path)
-    else:
-        raise HTTPException(status_code=404, detail="示例图片不存在")
+    # 查找匹配的文件
+    for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4"]:
+        file_path = os.path.join(MEDIA_CACHE_DIR, media_id + ext)
+        if os.path.exists(file_path):
+            return FileResponse(file_path)
+    
+    raise HTTPException(status_code=404, detail="媒体文件不存在")
+
+def cleanup_old_media(max_age_hours: int = 1):
+    """清理过期的媒体缓存文件"""
+    import time
+    now = time.time()
+    max_age_seconds = max_age_hours * 3600
+    
+    try:
+        for filename in os.listdir(MEDIA_CACHE_DIR):
+            file_path = os.path.join(MEDIA_CACHE_DIR, filename)
+            if os.path.isfile(file_path):
+                file_age = now - os.path.getmtime(file_path)
+                if file_age > max_age_seconds:
+                    os.remove(file_path)
+    except Exception:
+        pass
 
 # 存储有效的 session token
 _admin_sessions = set()
@@ -100,12 +123,8 @@ _config = {
     "APISID": "",
     "PUSH_ID": "",
     "FULL_COOKIE": "",  # 存储完整cookie字符串
-    "MANUAL_SNLM0E": "",  # 手动输入的 AT Token（用于保存用户输入）
-    "MANUAL_PUSH_ID": "",  # 手动输入的 PUSH_ID（用于保存用户输入）
     "MODELS": DEFAULT_MODELS.copy(),  # 可用模型列表
     "MODEL_IDS": DEFAULT_MODEL_IDS.copy(),  # 模型 ID 映射
-    "HTTP_PROXY": "",  # HTTP 代理
-    "HTTPS_PROXY": "",  # HTTPS 代理
 }
 
 # Cookie 字段映射 (浏览器cookie名 -> 配置字段名)
@@ -141,165 +160,56 @@ def parse_cookie_string(cookie_str: str) -> dict:
 
 def fetch_tokens_from_page(cookies_str: str) -> dict:
     """从 Gemini 页面自动获取 SNLM0E、PUSH_ID 和可用模型列表"""
-    result = {"snlm0e": "", "push_id": "", "models": [], "error": ""}
+    result = {"snlm0e": "", "push_id": "", "models": []}
     try:
-        import os
-        import ssl
-        
-        # 配置 SSL，与 client.py 保持一致
-        verify_ssl = True
-        if os.environ.get("DISABLE_SSL_VERIFY") == "1":
-            verify_ssl = False
-        
-        # 获取配置的代理设置
-        proxies = None
-        http_proxy = _config.get("HTTP_PROXY", "").strip()
-        https_proxy = _config.get("HTTPS_PROXY", "").strip()
-        
-        if http_proxy or https_proxy:
-            proxies = {}
-            if http_proxy:
-                proxies["http://"] = http_proxy
-            if https_proxy:
-                proxies["https://"] = https_proxy
-        else:
-            # 如果没有配置代理，检查环境变量（向后兼容）
-            if os.environ.get("DISABLE_PROXY") != "1":
-                http_env = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
-                https_env = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-                if http_env or https_env:
-                    proxies = {}
-                    if http_env:
-                        proxies["http://"] = http_env
-                    if https_env:
-                        proxies["https://"] = https_env
-        
-        # 构建 httpx.Client 的参数
-        client_kwargs = {
-            "timeout": 30.0,
-            "follow_redirects": True,
-            "verify": verify_ssl,
-            "headers": {
+        session = httpx.Client(
+            timeout=30.0,
+            follow_redirects=True,
+            headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             }
-        }
-        
-        # 如果配置了代理，添加到参数中
-        # httpx 使用 proxy 参数（单数），可以传递字符串或字典
-        if proxies:
-            # 优先使用 HTTPS 代理，如果没有则使用 HTTP 代理
-            proxy_url = proxies.get("https://") or proxies.get("http://")
-            if proxy_url:
-                client_kwargs["proxy"] = proxy_url
-        
-        session = httpx.Client(**client_kwargs)
+        )
         
         # 设置 cookies
-        cookie_count = 0
         for item in cookies_str.split(";"):
             item = item.strip()
             if "=" in item:
                 key, value = item.split("=", 1)
-                key = key.strip()
-                value = value.strip()
-                if key and value:
-                    session.cookies.set(key, value, domain=".google.com")
-                    cookie_count += 1
-        
-        if cookie_count == 0:
-            result["error"] = "Cookie 格式错误：未找到有效的 Cookie 键值对"
-            return result
+                session.cookies.set(key.strip(), value.strip(), domain=".google.com")
         
         resp = session.get("https://gemini.google.com")
         if resp.status_code != 200:
-            result["error"] = f"请求失败：HTTP {resp.status_code}，可能是 Cookie 无效或网络问题"
             return result
         
         html = resp.text
         
-        # 检查是否是登录页面（Cookie 可能已过期）
-        if "signin" in html.lower() or "login" in html.lower() or len(html) < 10000:
-            result["error"] = "检测到登录页面，Cookie 可能已过期，请重新获取最新的 Cookie"
-            return result
-        
-        # 获取 SNLM0E (AT Token) - 增加更多匹配模式
+        # 获取 SNLM0E (AT Token)
         snlm0e_patterns = [
-            r'"SNlM0e"\s*:\s*"([^"]+)"',  # 标准格式
-            r'"SNlM0e":\s*"([^"]+)"',     # 无空格
-            r'SNlM0e["\s:]+["\']([^"\']+)["\']',  # 灵活格式
-            r'"at"\s*:\s*"([^"]+)"',      # at 字段
-            r'var\s+SNlM0e\s*=\s*["\']([^"\']+)["\']',  # JavaScript 变量
-            r'window\.SNlM0e\s*=\s*["\']([^"\']+)["\']',  # window 对象
-            r'SNlM0e\s*=\s*["\']([^"\']+)["\']',  # 直接赋值
-            r'["\']SNlM0e["\']\s*:\s*["\']([^"\']+)["\']',  # 字符串键
+            r'"SNlM0e":"([^"]+)"',
+            r'SNlM0e["\s:]+["\']([^"\']+)["\']',
+            r'"at":"([^"]+)"',
         ]
-        
         for pattern in snlm0e_patterns:
-            match = re.search(pattern, html, re.IGNORECASE)
+            match = re.search(pattern, html)
             if match:
-                token = match.group(1)
-                # 验证 token 长度（通常 AT Token 是较长的字符串）
-                if len(token) > 10:
-                    result["snlm0e"] = token
-                    break
+                result["snlm0e"] = match.group(1)
+                break
         
-        # 如果还是没找到，尝试在 JavaScript 代码块中搜索
-        if not result["snlm0e"]:
-            # 搜索 script 标签中的内容
-            script_pattern = r'<script[^>]*>(.*?)</script>'
-            scripts = re.findall(script_pattern, html, re.DOTALL | re.IGNORECASE)
-            for script in scripts:
-                for pattern in snlm0e_patterns:
-                    match = re.search(pattern, script, re.IGNORECASE)
-                    if match:
-                        token = match.group(1)
-                        if len(token) > 10:
-                            result["snlm0e"] = token
-                            break
-                if result["snlm0e"]:
-                    break
-        
-        # 获取 PUSH_ID - 增加更多匹配模式
+        # 获取 PUSH_ID
         push_id_patterns = [
-            r'"push[_-]?id["\s:]+["\'](feeds/[a-z0-9]+)["\']',  # "push_id": "feeds/xxx"
-            r'push[_-]?id["\s:=]+["\'](feeds/[a-z0-9]+)["\']',  # push_id="feeds/xxx"
-            r'feedName["\s:]+["\'](feeds/[a-z0-9]+)["\']',      # "feedName": "feeds/xxx"
-            r'clientId["\s:]+["\'](feeds/[a-z0-9]+)["\']',      # "clientId": "feeds/xxx"
-            r'["\']push[_-]?id["\']\s*:\s*["\'](feeds/[a-z0-9]+)["\']',  # 'push_id': 'feeds/xxx'
-            r'push[_-]?id\s*=\s*["\'](feeds/[a-z0-9]+)["\']',   # push_id = "feeds/xxx"
-            r'(feeds/[a-z0-9]{14,})',                            # 直接匹配 feeds/xxx 格式（14位以上）
+            r'"push[_-]?id["\s:]+["\'](feeds/[a-z0-9]+)["\']',
+            r'push[_-]?id["\s:=]+["\'](feeds/[a-z0-9]+)["\']',
+            r'feedName["\s:]+["\'](feeds/[a-z0-9]+)["\']',
+            r'clientId["\s:]+["\'](feeds/[a-z0-9]+)["\']',
+            r'(feeds/[a-z0-9]{14,})',
         ]
-        
-        # 先尝试精确匹配
         for pattern in push_id_patterns:
             matches = re.findall(pattern, html, re.IGNORECASE)
             if matches:
-                # 验证格式（应该是 feeds/ 开头，后面跟着字母数字）
-                for match in matches:
-                    if match.startswith("feeds/") and len(match) > 15:
-                        result["push_id"] = match
-                        break
-                if result["push_id"]:
-                    break
-        
-        # 如果精确匹配失败，尝试在 JavaScript 代码块中搜索
-        if not result["push_id"]:
-            script_pattern = r'<script[^>]*>(.*?)</script>'
-            scripts = re.findall(script_pattern, html, re.DOTALL | re.IGNORECASE)
-            for script in scripts:
-                for pattern in push_id_patterns:
-                    matches = re.findall(pattern, script, re.IGNORECASE)
-                    if matches:
-                        for match in matches:
-                            if match.startswith("feeds/") and len(match) > 15:
-                                result["push_id"] = match
-                                break
-                        if result["push_id"]:
-                            break
-                if result["push_id"]:
-                    break
+                result["push_id"] = matches[0]
+                break
         
         # 获取可用模型列表 (从页面中提取 gemini 模型 ID)
         model_patterns = [
@@ -339,14 +249,7 @@ def fetch_tokens_from_page(cookies_str: str) -> dict:
                 result["model_ids"] = list(hex_ids)
         
         return result
-    except httpx.TimeoutException:
-        result["error"] = "请求超时，请检查网络连接"
-        return result
-    except httpx.RequestError as e:
-        result["error"] = f"网络请求失败：{str(e)}"
-        return result
-    except Exception as e:
-        result["error"] = f"未知错误：{str(e)}"
+    except Exception:
         return result
 
 _client = None
@@ -446,35 +349,9 @@ def load_config():
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
                 if saved.get("SNLM0E") and saved.get("SECURE_1PSID"):
-                    # 只更新允许的配置字段，避免意外添加其他键
-                    allowed_keys = [
-                        "SNLM0E", "SECURE_1PSID", "SECURE_1PSIDTS", "SAPISID", 
-                        "SID", "HSID", "SSID", "APISID", "PUSH_ID", "FULL_COOKIE",
-                        "MANUAL_SNLM0E", "MANUAL_PUSH_ID", "MODELS", "MODEL_IDS",
-                        "HTTP_PROXY", "HTTPS_PROXY"
-                    ]
-                    for key in allowed_keys:
-                        if key in saved:
-                            if key == "MODEL_IDS":
-                                # 特殊处理 MODEL_IDS，确保是字典类型
-                                if isinstance(saved[key], dict):
-                                    _config[key] = saved[key].copy()
-                                else:
-                                    _config[key] = DEFAULT_MODEL_IDS.copy()
-                            elif key == "MODELS":
-                                # 确保 MODELS 是列表
-                                if isinstance(saved[key], list):
-                                    _config[key] = saved[key].copy()
-                                else:
-                                    _config[key] = DEFAULT_MODELS.copy()
-                            else:
-                                _config[key] = saved[key]
-                    # 确保 MODEL_IDS 存在且是字典
-                    if "MODEL_IDS" not in _config or not isinstance(_config.get("MODEL_IDS"), dict):
-                        _config["MODEL_IDS"] = DEFAULT_MODEL_IDS.copy()
+                    _config.update(saved)
                     loaded_from_json = True
-        except Exception as e:
-            print(f"[WARNING] 加载配置失败: {e}")
+        except:
             pass
     
     # 如果 JSON 没有有效配置，尝试从 config.py 加载
@@ -517,76 +394,525 @@ def get_client():
     if _config.get("APISID"):
         cookies += f"; APISID={_config['APISID']}"
     
+    # 构建媒体文件的基础 URL
+    media_base_url = f"http://localhost:{PORT}"
+    
     from client import GeminiClient
-    # 确保 model_ids 是字典类型，并创建副本避免修改原始配置
-    model_ids_raw = _config.get("MODEL_IDS")
-    if not isinstance(model_ids_raw, dict):
-        model_ids = DEFAULT_MODEL_IDS.copy()
-    else:
-        # 创建副本，避免修改原始配置，并确保只包含有效的键
-        model_ids = {
-            "flash": model_ids_raw.get("flash", DEFAULT_MODEL_IDS["flash"]),
-            "pro": model_ids_raw.get("pro", DEFAULT_MODEL_IDS["pro"]),
-            "thinking": model_ids_raw.get("thinking", DEFAULT_MODEL_IDS["thinking"])
-        }
-    
-    # 确保代理配置是字符串类型
-    http_proxy = _config.get("HTTP_PROXY")
-    if http_proxy and not isinstance(http_proxy, str):
-        http_proxy = None
-    elif http_proxy:
-        http_proxy = http_proxy.strip() or None
-    
-    https_proxy = _config.get("HTTPS_PROXY")
-    if https_proxy and not isinstance(https_proxy, str):
-        https_proxy = None
-    elif https_proxy:
-        https_proxy = https_proxy.strip() or None
-    
     _client = GeminiClient(
         secure_1psid=_config["SECURE_1PSID"],
         snlm0e=_config["SNLM0E"],
         cookies_str=cookies,
         push_id=_config.get("PUSH_ID") or None,
-        model_ids=model_ids,  # 传递字典，不是解包
+        model_ids=_config.get("MODEL_IDS") or DEFAULT_MODEL_IDS,
         debug=False,
-        http_proxy=http_proxy,  # 传递代理配置
-        https_proxy=https_proxy,  # 传递代理配置
+        media_base_url=media_base_url,
     )
     return _client
 
 
 def get_login_html():
-    """读取登录页面模板"""
-    template_path = os.path.join(os.path.dirname(__file__), "templates", "login.html")
-    if os.path.exists(template_path):
-        with open(template_path, "r", encoding="utf-8") as f:
-            return f.read()
-    else:
-        # 降级方案：返回简单的HTML
-        return '''<!DOCTYPE html>
-<html><head><title>登录</title></head>
-<body><h1>模板文件未找到，请确保 templates/login.html 存在</h1></body>
+    return '''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>登录 - Gemini API</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; 
+            display: flex; align-items: center; justify-content: center; padding: 20px; }
+        .login-card { background: white; border-radius: 16px; padding: 40px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); width: 100%; max-width: 400px; }
+        h1 { color: #333; margin-bottom: 10px; font-size: 28px; text-align: center; }
+        .subtitle { color: #666; margin-bottom: 30px; font-size: 14px; text-align: center; }
+        .form-group { margin-bottom: 20px; }
+        label { display: block; font-size: 13px; font-weight: 500; color: #555; margin-bottom: 8px; }
+        input { width: 100%; padding: 14px 16px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 15px; transition: border-color 0.2s; }
+        input:focus { outline: none; border-color: #667eea; }
+        .btn { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; padding: 14px 30px;
+            border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; width: 100%; margin-top: 10px; transition: transform 0.2s, box-shadow 0.2s; }
+        .btn:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(102,126,234,0.4); }
+        .btn:disabled { opacity: 0.7; cursor: not-allowed; transform: none; }
+        .error { background: #f8d7da; color: #721c24; padding: 12px; border-radius: 8px; margin-bottom: 20px; font-size: 14px; display: none; }
+        .logo { text-align: center; margin-bottom: 20px; font-size: 48px; }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <div class="logo">🤖</div>
+        <h1>Gemini API</h1>
+        <p class="subtitle">请登录以访问后台管理</p>
+        
+        <div id="error" class="error"></div>
+        
+        <form id="loginForm">
+            <div class="form-group">
+                <label>用户名</label>
+                <input type="text" name="username" id="username" placeholder="请输入用户名" required autofocus>
+            </div>
+            <div class="form-group">
+                <label>密码</label>
+                <input type="password" name="password" id="password" placeholder="请输入密码" required>
+            </div>
+            <button type="submit" class="btn" id="submitBtn">登 录</button>
+        </form>
+    </div>
+    
+    <script>
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const errorEl = document.getElementById('error');
+            const submitBtn = document.getElementById('submitBtn');
+            
+            errorEl.style.display = 'none';
+            submitBtn.disabled = true;
+            submitBtn.textContent = '登录中...';
+            
+            try {
+                const resp = await fetch('/admin/login', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        username: document.getElementById('username').value,
+                        password: document.getElementById('password').value
+                    })
+                });
+                const result = await resp.json();
+                
+                if (result.success) {
+                    window.location.href = '/admin';
+                } else {
+                    errorEl.textContent = result.message || '登录失败';
+                    errorEl.style.display = 'block';
+                }
+            } catch (err) {
+                errorEl.textContent = '网络错误: ' + err.message;
+                errorEl.style.display = 'block';
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.textContent = '登 录';
+            }
+        });
+    </script>
+</body>
 </html>'''
 
 
 def get_admin_html():
-    """读取管理后台页面模板并替换变量"""
-    template_path = os.path.join(os.path.dirname(__file__), "templates", "admin.html")
-    if os.path.exists(template_path):
-        with open(template_path, "r", encoding="utf-8") as f:
-            html = f.read()
-            # 替换模板变量
-            html = html.replace("{{ API_KEY }}", API_KEY)
-            html = html.replace("{{ PORT }}", str(PORT))
-            return html
-    else:
-        # 降级方案：返回简单的HTML
-        return f'''<!DOCTYPE html>
-<html><head><title>配置</title></head>
-<body><h1>模板文件未找到，请确保 templates/admin.html 存在</h1>
-<p>API Key: {API_KEY}</p>
-<p>Port: {PORT}</p>
+    return '''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemini API 配置</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .card { background: white; border-radius: 16px; padding: 30px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
+        h1 { color: #333; margin-bottom: 10px; font-size: 28px; }
+        .subtitle { color: #666; margin-bottom: 30px; font-size: 14px; }
+        .section { margin-bottom: 25px; }
+        .section-title { font-size: 16px; font-weight: 600; color: #333; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 2px solid #eee; }
+        .required { color: #e74c3c; }
+        .optional { color: #95a5a6; font-size: 12px; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; font-size: 13px; font-weight: 500; color: #555; margin-bottom: 5px; }
+        input, textarea { width: 100%; padding: 12px 15px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 14px; font-family: monospace; transition: border-color 0.2s; }
+        input:focus, textarea:focus { outline: none; border-color: #667eea; }
+        textarea { resize: vertical; min-height: 80px; }
+        .btn { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; padding: 14px 30px;
+            border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; width: 100%; margin-top: 20px; transition: transform 0.2s, box-shadow 0.2s; }
+        .btn:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(102,126,234,0.4); }
+        .status { margin-top: 20px; padding: 15px; border-radius: 8px; font-size: 14px; display: none; }
+        .status.success { background: #d4edda; color: #155724; display: block; }
+        .status.error { background: #f8d7da; color: #721c24; display: block; }
+        .info-box { background: #f8f9fa; border-radius: 8px; padding: 15px; margin-bottom: 20px; font-size: 13px; color: #666; }
+        .info-box code { background: #e9ecef; padding: 2px 6px; border-radius: 4px; }
+        .api-info { background: #e8f4fd; border-left: 4px solid #667eea; padding: 15px; margin-top: 20px; border-radius: 0 8px 8px 0; }
+        .api-info h3 { font-size: 14px; margin-bottom: 10px; color: #333; }
+        .api-info pre { background: #fff; padding: 10px; border-radius: 4px; font-size: 12px; margin-top: 5px; overflow-x: auto; }
+        .parsed-info { background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 8px; padding: 15px; margin-top: 15px; font-size: 12px; display: none; }
+        .parsed-info h4 { color: #0369a1; margin-bottom: 10px; }
+        .parsed-info .item { margin: 5px 0; color: #555; }
+        .parsed-info .item span { color: #059669; font-family: monospace; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <h1>🤖 Gemini API 配置</h1>
+            <p class="subtitle">配置 Google Gemini 的认证信息，保存后即可调用 API <a href="/admin/logout" style="float:right;color:#667eea;text-decoration:none;">退出登录</a></p>
+            
+            <div class="info-box">
+                <strong>获取方法：</strong><br>
+                1. 打开 <a href="https://gemini.google.com" target="_blank">gemini.google.com</a> 并登录<br>
+                2. F12 → 网络 → 发送内容到聊天 →  点击任意请求 → Copy 请求头内完整cookie
+            </div>
+            
+            <form id="configForm">
+                <div class="section">
+                    <div class="section-title">🔑 Cookie 配置</div>
+                    <div class="form-group">
+                        <label>完整 Cookie <span class="required">*</span></label>
+                        <textarea name="FULL_COOKIE" id="FULL_COOKIE" rows="6" placeholder="粘贴从浏览器复制的完整 Cookie 字符串，系统会自动解析所需字段和 Token..." required></textarea>
+                        <div id="parsedInfo" class="parsed-info">
+                            <h4>✅ 已解析的字段：</h4>
+                            <div id="parsedFields"></div>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>AT Token (SNLM0E) <span class="optional">(可选，自动获取失败时可手动填写)</span></label>
+                        <input type="text" name="SNLM0E" id="SNLM0E" placeholder="如果自动获取失败，请手动填写 AT Token。获取方法：F12 → 查看页面源代码 (Ctrl+U) → 搜索 'SNlM0e' → 复制引号内的值">
+                        <div class="info-box" style="margin-top:8px;font-size:12px;">
+                            <strong>💡 提示：</strong>系统会优先尝试自动获取 AT Token。如果自动获取失败（Cookie 过期或网络问题），可以手动填写此字段。
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>PUSH ID <span class="optional">(可选，图片上传功能需要，自动获取失败时可手动填写)</span></label>
+                        <input type="text" name="PUSH_ID" id="PUSH_ID" placeholder="格式：feeds/xxxxx（约20-30个字符）">
+                        <div class="info-box" style="margin-top:8px;font-size:12px;line-height:1.6;">
+                            <strong>📖 获取方法（两种方法任选其一）：</strong><br>
+                            <strong>方法1 - 从页面源码获取（推荐，最简单）：</strong><br>
+                            1. 打开 <a href="https://gemini.google.com" target="_blank">gemini.google.com</a> 并登录<br>
+                            2. 按 <code>F12</code> 打开开发者工具<br>
+                            3. 点击 <code>Sources</code>（源代码）标签，或按 <code>Ctrl+U</code> 查看页面源码<br>
+                            4. 按 <code>Ctrl+F</code> 搜索 <code>feeds/</code><br>
+                            5. 找到类似 <code>"push_id":"feeds/xxxxxxxxxxxxx"</code> 或 <code>feeds/xxxxxxxxxxxxx</code> 的字符串<br>
+                            6. 复制整个 <code>feeds/</code> 开头的值（包含 feeds/ 和后面的字符）<br><br>
+                            <strong>方法2 - 从网络请求获取：</strong><br>
+                            1. 打开 <a href="https://gemini.google.com" target="_blank">gemini.google.com</a> 并登录<br>
+                            2. 按 <code>F12</code> 打开开发者工具，切换到 <code>Network</code>（网络）标签<br>
+                            3. 在 Gemini 页面中上传一张图片（点击图片上传按钮）<br>
+                            4. 在 Network 标签中找到 <code>upload</code> 相关的 <strong>POST</strong> 请求（不是 OPTIONS 请求）<br>
+                            5. 点击该请求，查看 <code>Request Headers</code>（请求头）<br>
+                            6. 找到 <code>push-id:</code> 字段，复制其值（格式为 <code>feeds/xxxxx</code>）
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="section">
+                    <div class="section-title">🎯 模型 ID 配置 <span class="optional">(可选，如果模型切换失效请更新)</span></div>
+                    <div class="info-box">
+                        <strong>获取方法：</strong>F12 → Network → 在 Gemini 中切换模型发送消息 → 找到请求头 <code>x-goog-ext-525001261-jspb</code> → 复制整个数组值粘贴到下方输入框
+                    </div>
+                    <div class="form-group">
+                        <label>快速解析 <span class="optional">(粘贴请求头数组自动提取 ID)</span></label>
+                        <input type="text" id="MODEL_ID_PARSER" placeholder='粘贴如: [1,null,null,null,"56fdd199312815e2",null,null,0,[4],null,null,2]'>
+                        <div id="parsedModelId" class="parsed-info" style="margin-top:10px;">
+                            <h4>✅ 已提取的模型 ID：</h4>
+                            <div id="parsedModelIdValue"></div>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>极速版 (Flash) ID</label>
+                        <input type="text" name="MODEL_ID_FLASH" id="MODEL_ID_FLASH" placeholder="56fdd199312815e2">
+                    </div>
+                    <div class="form-group">
+                        <label>Pro 版 ID</label>
+                        <input type="text" name="MODEL_ID_PRO" id="MODEL_ID_PRO" placeholder="e6fa609c3fa255c0">
+                    </div>
+                    <div class="form-group">
+                        <label>思考版 (Thinking) ID</label>
+                        <input type="text" name="MODEL_ID_THINKING" id="MODEL_ID_THINKING" placeholder="e051ce1aa80aa576">
+                    </div>
+                </div>
+                
+                <button type="submit" class="btn">💾 保存配置</button>
+            </form>
+            
+            <div id="status" class="status"></div>
+            
+            <div class="api-info">
+                <h3>📡 API 调用信息</h3>
+                <p>Base URL: <strong id="baseUrl"></strong></p>
+                <p>API Key: <strong id="apiKey"></strong></p>
+                <p>可用模型: <code>gemini-3.0-flash</code> | <code>gemini-3.0-pro</code> | <code>gemini-3.0-flash-thinking</code></p>
+                
+                <h4 style="margin-top:15px;">💬 文本对话</h4>
+<pre>from openai import OpenAI
+client = OpenAI(base_url="<span id="codeUrl"></span>", api_key="<span id="codeKey"></span>")
+
+response = client.chat.completions.create(
+    model="gemini-3.0-flash",  # 或 gemini-3.0-pro / gemini-3.0-flash-thinking
+    messages=[{"role": "user", "content": "你好"}]
+)
+print(response.choices[0].message.content)</pre>
+
+                <h4 style="margin-top:15px;">🖼️ 图片识别</h4>
+<pre>import base64
+from openai import OpenAI
+client = OpenAI(base_url="<span id="codeUrl2"></span>", api_key="<span id="codeKey2"></span>")
+
+# 读取本地图片
+with open("image.png", "rb") as f:
+    img_b64 = base64.b64encode(f.read()).decode()
+
+response = client.chat.completions.create(
+    model="gemini-3.0-flash",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "请描述这张图片"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+        ]
+    }]
+)
+print(response.choices[0].message.content)</pre>
+
+                <h4 style="margin-top:15px;">🌊 流式响应</h4>
+<pre>stream = client.chat.completions.create(
+    model="gemini-3.0-flash",
+    messages=[{"role": "user", "content": "写一首诗"}],
+    stream=True
+)
+for chunk in stream:
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)</pre>
+
+                <h4 style="margin-top:15px;">📷 示例图片</h4>
+                <p style="font-size:12px;color:#666;">以下是 image.png 示例图片，可用于测试图片识别功能（点击放大）：</p>
+                <img id="sampleImage" src="/static/image.png" alt="示例图片" style="max-width:300px;border-radius:8px;margin-top:10px;border:1px solid #ddd;cursor:pointer;" onclick="showImageModal()" onerror="this.style.display='none';this.nextElementSibling.style.display='block';">
+                <p style="display:none;font-size:12px;color:#999;">（示例图片不可用，请确保 image.png 文件存在）</p>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 图片放大模态框 -->
+    <div id="imageModal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.8);z-index:1000;justify-content:center;align-items:center;cursor:pointer;" onclick="hideImageModal()">
+        <img src="/static/image.png" alt="示例图片" style="max-width:90%;max-height:90%;border-radius:8px;box-shadow:0 0 30px rgba(0,0,0,0.5);">
+        <span style="position:absolute;top:20px;right:30px;color:white;font-size:30px;cursor:pointer;">&times;</span>
+    </div>
+    
+    <script>
+        // 图片放大功能
+        function showImageModal() {
+            document.getElementById('imageModal').style.display = 'flex';
+            document.body.style.overflow = 'hidden';
+        }
+        function hideImageModal() {
+            document.getElementById('imageModal').style.display = 'none';
+            document.body.style.overflow = 'auto';
+        }
+        // ESC 键关闭
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') hideImageModal();
+        });
+        
+        const API_KEY = "''' + API_KEY + '''";
+        const PORT = ''' + str(PORT) + ''';
+        
+        document.getElementById('baseUrl').textContent = 'http://localhost:' + PORT + '/v1';
+        document.getElementById('apiKey').textContent = API_KEY;
+        document.getElementById('codeUrl').textContent = 'http://localhost:' + PORT + '/v1';
+        document.getElementById('codeKey').textContent = API_KEY;
+        document.getElementById('codeUrl2').textContent = 'http://localhost:' + PORT + '/v1';
+        document.getElementById('codeKey2').textContent = API_KEY;
+        
+        // 解析模型 ID (从 x-goog-ext-525001261-jspb 数组中提取)
+        function parseModelId(input) {
+            try {
+                // 尝试解析 JSON 数组
+                const arr = JSON.parse(input);
+                if (Array.isArray(arr) && arr.length > 4 && typeof arr[4] === 'string') {
+                    return arr[4];
+                }
+            } catch (e) {
+                // 尝试用正则提取 16 位十六进制字符串
+                const match = input.match(/["\']([a-f0-9]{16})["\']/i);
+                if (match) {
+                    return match[1];
+                }
+            }
+            return null;
+        }
+        
+        // 监听模型 ID 解析输入
+        document.getElementById('MODEL_ID_PARSER').addEventListener('input', (e) => {
+            const modelId = parseModelId(e.target.value);
+            const container = document.getElementById('parsedModelIdValue');
+            const infoBox = document.getElementById('parsedModelId');
+            
+            if (modelId) {
+                container.innerHTML = '<div class="item">提取到的 ID: <span style="color:#059669;font-family:monospace;">' + modelId + '</span></div>' +
+                    '<div style="margin-top:10px;">' +
+                    '<button type="button" onclick="fillModelId(\\'flash\\', \\'' + modelId + '\\')" style="margin-right:5px;padding:5px 10px;cursor:pointer;">填入极速版</button>' +
+                    '<button type="button" onclick="fillModelId(\\'pro\\', \\'' + modelId + '\\')" style="margin-right:5px;padding:5px 10px;cursor:pointer;">填入Pro版</button>' +
+                    '<button type="button" onclick="fillModelId(\\'thinking\\', \\'' + modelId + '\\')" style="padding:5px 10px;cursor:pointer;">填入思考版</button>' +
+                    '</div>';
+                infoBox.style.display = 'block';
+            } else {
+                infoBox.style.display = 'none';
+            }
+        });
+        
+        // 填入模型 ID
+        function fillModelId(type, id) {
+            const fieldMap = {
+                'flash': 'MODEL_ID_FLASH',
+                'pro': 'MODEL_ID_PRO',
+                'thinking': 'MODEL_ID_THINKING'
+            };
+            document.getElementById(fieldMap[type]).value = id;
+        }
+        
+        // Cookie 字段映射
+        const cookieFields = {
+            '__Secure-1PSID': 'SECURE_1PSID',
+            '__Secure-1PSIDTS': 'SECURE_1PSIDTS',
+            'SAPISID': 'SAPISID',
+            '__Secure-1PAPISID': 'SECURE_1PAPISID',
+            'SID': 'SID',
+            'HSID': 'HSID',
+            'SSID': 'SSID',
+            'APISID': 'APISID'
+        };
+        
+        // 解析 Cookie 字符串
+        function parseCookie(cookieStr) {
+            const result = {};
+            if (!cookieStr) return result;
+            
+            cookieStr.split(';').forEach(item => {
+                const trimmed = item.trim();
+                const eqIndex = trimmed.indexOf('=');
+                if (eqIndex > 0) {
+                    const key = trimmed.substring(0, eqIndex).trim();
+                    const value = trimmed.substring(eqIndex + 1).trim();
+                    if (cookieFields[key]) {
+                        result[cookieFields[key]] = value;
+                    }
+                }
+            });
+            return result;
+        }
+        
+        // 显示解析结果
+        function showParsedFields(parsed) {
+            const container = document.getElementById('parsedFields');
+            const infoBox = document.getElementById('parsedInfo');
+            
+            const fieldNames = {
+                'SECURE_1PSID': '__Secure-1PSID',
+                'SECURE_1PSIDTS': '__Secure-1PSIDTS',
+                'SAPISID': 'SAPISID',
+                'SID': 'SID',
+                'HSID': 'HSID',
+                'SSID': 'SSID',
+                'APISID': 'APISID'
+            };
+            
+            let html = '';
+            let hasFields = false;
+            for (const [key, name] of Object.entries(fieldNames)) {
+                if (parsed[key]) {
+                    hasFields = true;
+                    const shortValue = parsed[key].length > 30 ? parsed[key].substring(0, 30) + '...' : parsed[key];
+                    html += '<div class="item">' + name + ': <span>' + shortValue + '</span></div>';
+                }
+            }
+            
+            if (hasFields) {
+                container.innerHTML = html;
+                infoBox.style.display = 'block';
+            } else {
+                infoBox.style.display = 'none';
+            }
+        }
+        
+        // 监听 Cookie 输入
+        document.getElementById('FULL_COOKIE').addEventListener('input', (e) => {
+            const parsed = parseCookie(e.target.value);
+            showParsedFields(parsed);
+        });
+        
+        // 加载配置
+        fetch('/admin/config', {credentials: 'same-origin'}).then(r => {
+            if (!r.ok) throw new Error('未登录');
+            return r.json();
+        }).then(config => {
+            if (config.FULL_COOKIE) {
+                document.getElementById('FULL_COOKIE').value = config.FULL_COOKIE;
+                showParsedFields(parseCookie(config.FULL_COOKIE));
+            }
+            // 加载 AT Token
+            if (config.SNLM0E) {
+                document.getElementById('SNLM0E').value = config.SNLM0E;
+            }
+            // 加载 PUSH ID
+            if (config.PUSH_ID) {
+                document.getElementById('PUSH_ID').value = config.PUSH_ID;
+            }
+            // 加载模型 ID
+            if (config.MODEL_IDS) {
+                document.getElementById('MODEL_ID_FLASH').value = config.MODEL_IDS.flash || '';
+                document.getElementById('MODEL_ID_PRO').value = config.MODEL_IDS.pro || '';
+                document.getElementById('MODEL_ID_THINKING').value = config.MODEL_IDS.thinking || '';
+            }
+        }).catch(err => {
+            console.log('加载配置失败:', err);
+        });
+        
+        document.getElementById('configForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const formData = new FormData(e.target);
+            const data = Object.fromEntries(formData.entries());
+            
+            // 构建模型 ID 对象
+            data.MODEL_IDS = {
+                flash: data.MODEL_ID_FLASH || '',
+                pro: data.MODEL_ID_PRO || '',
+                thinking: data.MODEL_ID_THINKING || ''
+            };
+            delete data.MODEL_ID_FLASH;
+            delete data.MODEL_ID_PRO;
+            delete data.MODEL_ID_THINKING;
+            
+            const statusEl = document.getElementById('status');
+            statusEl.className = 'status';
+            statusEl.style.display = 'none';
+            statusEl.textContent = '';
+            
+            // 显示保存中状态
+            const submitBtn = e.target.querySelector('button[type="submit"]');
+            const originalText = submitBtn.textContent;
+            submitBtn.textContent = '⏳ 保存中...';
+            submitBtn.disabled = true;
+            
+            try {
+                const resp = await fetch('/admin/save', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    credentials: 'same-origin',
+                    body: JSON.stringify(data)
+                });
+                
+                if (resp.status === 401) {
+                    window.location.href = '/admin/login';
+                    return;
+                }
+                
+                const result = await resp.json();
+                
+                if (result.success) {
+                    statusEl.className = 'status success';
+                    statusEl.innerHTML = '✅ ' + result.message + '<br><br>💡 <strong>配置已生效，无需重启服务！</strong>';
+                } else {
+                    statusEl.className = 'status error';
+                    statusEl.textContent = '❌ ' + result.message;
+                }
+                statusEl.style.display = 'block';
+            } catch (err) {
+                statusEl.className = 'status error';
+                statusEl.textContent = '❌ 保存失败: ' + err.message;
+                statusEl.style.display = 'block';
+            } finally {
+                submitBtn.textContent = originalText;
+                submitBtn.disabled = false;
+            }
+        });
+    </script>
 </body>
 </html>'''
 
@@ -651,66 +977,36 @@ async def admin_save(request: Request):
     # 从页面自动获取 SNLM0E 和 PUSH_ID
     tokens = fetch_tokens_from_page(full_cookie)
     
-    # 检查是否有手动输入的 AT Token
-    manual_snlm0e = data.get("MANUAL_SNLM0E", "").strip()
-    token_source = ""  # 初始化变量
-    
-    # 确定使用哪个 AT Token
+    # 优先使用手动输入的 AT Token，如果未手动输入则使用自动获取的
+    manual_snlm0e = data.get("SNLM0E", "").strip()
     if manual_snlm0e:
-        # 优先使用手动输入的 Token
-        snlm0e_to_use = manual_snlm0e
+        # 使用手动输入的 AT Token
+        snlm0e = manual_snlm0e
         token_source = "手动输入"
     elif tokens.get("snlm0e"):
-        # 使用自动获取的 Token
-        snlm0e_to_use = tokens["snlm0e"]
+        # 使用自动获取的 AT Token
+        snlm0e = tokens["snlm0e"]
         token_source = "自动获取"
     else:
-        # 两者都没有，返回错误
-        error_msg = tokens.get("error", "未知错误")
-        if error_msg:
-            return {
-                "success": False, 
-                "message": f"无法自动获取 AT Token：{error_msg}\n\n提示：如果自动获取失败，可以在上方手动填写 AT Token。获取方法：打开 gemini.google.com → F12 → 查看页面源代码 (Ctrl+U) → 搜索 'SNlM0e' → 复制引号内的值"
-            }
-        else:
-            return {
-                "success": False, 
-                "message": "无法自动获取 AT Token，请检查 Cookie 是否有效或已过期。\n\n提示：\n1. 请确保 Cookie 是从已登录的浏览器中完整复制的，包含所有字段\n2. 如果自动获取失败，可以在上方手动填写 AT Token"
-            }
+        # 既没有手动输入，也无法自动获取
+        return {"success": False, "message": "无法自动获取 AT Token，请检查 Cookie 是否有效或已过期，或手动填写 AT Token 字段"}
     
-    # 检查是否有手动输入的 PUSH_ID
-    manual_push_id = data.get("MANUAL_PUSH_ID", "").strip()
-    
-    # 确定使用哪个 PUSH_ID
+    # 处理 PUSH_ID：优先使用手动输入的，如果未手动输入则使用自动获取的
+    manual_push_id = data.get("PUSH_ID", "").strip()
     if manual_push_id:
-        # 优先使用手动输入的 PUSH_ID
-        push_id_to_use = manual_push_id
-        # 确保格式正确（应该是 feeds/xxxxx）
-        if not push_id_to_use.startswith("feeds/"):
-            if "/" not in push_id_to_use:
-                push_id_to_use = f"feeds/{push_id_to_use}"
-            else:
-                # 如果用户输入了完整路径，直接使用
-                pass
+        push_id = manual_push_id
+        push_id_source = "手动输入"
     elif tokens.get("push_id"):
-        # 使用自动获取的 PUSH_ID
-        push_id_to_use = tokens["push_id"]
+        push_id = tokens["push_id"]
+        push_id_source = "自动获取"
     else:
-        # 两者都没有，保持为空（图片功能不可用）
-        push_id_to_use = ""
+        push_id = ""
+        push_id_source = "未获取"
     
     # 更新配置
     _config["FULL_COOKIE"] = full_cookie
-    _config["SNLM0E"] = snlm0e_to_use
-    _config["PUSH_ID"] = push_id_to_use
-    
-    # 保存手动输入的值（无论是否为空，都保存，这样用户可以清空）
-    # 如果字段在表单中存在，就保存它（包括空字符串）
-    if "MANUAL_SNLM0E" in data:
-        _config["MANUAL_SNLM0E"] = manual_snlm0e
-    
-    if "MANUAL_PUSH_ID" in data:
-        _config["MANUAL_PUSH_ID"] = manual_push_id
+    _config["SNLM0E"] = snlm0e
+    _config["PUSH_ID"] = push_id
     
     # 从解析结果更新各字段
     for field in ["SECURE_1PSID", "SECURE_1PSIDTS", "SAPISID", "SID", "HSID", "SSID", "APISID"]:
@@ -724,44 +1020,31 @@ async def admin_save(request: Request):
     
     # 处理模型 ID 配置
     model_ids = data.get("MODEL_IDS", {})
-    if model_ids and isinstance(model_ids, dict):
-        # 确保 _config["MODEL_IDS"] 是字典
-        if not isinstance(_config.get("MODEL_IDS"), dict):
-            _config["MODEL_IDS"] = DEFAULT_MODEL_IDS.copy()
-        # 只更新非空的值，确保不会覆盖整个字典
+    if model_ids:
+        # 只更新非空的值
         if model_ids.get("flash"):
             _config["MODEL_IDS"]["flash"] = model_ids["flash"]
         if model_ids.get("pro"):
             _config["MODEL_IDS"]["pro"] = model_ids["pro"]
         if model_ids.get("thinking"):
             _config["MODEL_IDS"]["thinking"] = model_ids["thinking"]
-    # 如果 MODEL_IDS 不存在或不是字典，确保使用默认值
-    if not isinstance(_config.get("MODEL_IDS"), dict):
-        _config["MODEL_IDS"] = DEFAULT_MODEL_IDS.copy()
-    
-    # 保存代理配置
-    _config["HTTP_PROXY"] = data.get("HTTP_PROXY", "").strip()
-    _config["HTTPS_PROXY"] = data.get("HTTPS_PROXY", "").strip()
     
     save_config()
     _client = None
     
     # 构建结果信息
     parsed_fields = [k for k in ["SECURE_1PSID", "SECURE_1PSIDTS", "SAPISID", "SID", "HSID", "SSID", "APISID"] if parsed.get(k)]
-    push_id_source = ""
-    if manual_push_id:
-        push_id_source = "（手动输入）"
-    elif tokens.get("push_id"):
-        push_id_source = "（自动获取）"
-    push_id_msg = f"，PUSH_ID ✓ {push_id_source}" if _config.get("PUSH_ID") else "，PUSH_ID ✗ (图片功能不可用)"
+    if push_id:
+        push_id_msg = f"，PUSH_ID ✓ ({push_id_source})"
+    else:
+        push_id_msg = "，PUSH_ID ✗ (图片功能不可用，可手动填写)"
     models_msg = f"，{len(_config['MODELS'])} 个模型" if _config.get("MODELS") else ""
-    token_source_msg = f"（{token_source}）" if token_source else ""
     
     try:
         get_client()
         return {
             "success": True, 
-            "message": f"配置已保存并验证成功！AT Token ✓ {token_source_msg}{push_id_msg}{models_msg}",
+            "message": f"配置已保存并验证成功！AT Token ✓ ({token_source}){push_id_msg}{models_msg}",
             "need_restart": False
         }
     except Exception as e:

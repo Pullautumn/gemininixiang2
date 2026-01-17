@@ -11,8 +11,6 @@ import string
 import base64
 import uuid
 import httpx
-import ssl
-import os
 from typing import Optional, List, Dict, Any, Union
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -108,8 +106,7 @@ class GeminiClient:
         push_id: str = None,
         model_ids: dict = None,
         debug: bool = False,
-        http_proxy: str = None,  # 新增：HTTP 代理
-        https_proxy: str = None,  # 新增：HTTPS 代理
+        media_base_url: str = None,
     ):
         """
         初始化客户端 - 手动填写 token
@@ -124,8 +121,7 @@ class GeminiClient:
             push_id: Push ID for image upload (必填用于图片上传)
             model_ids: 模型 ID 映射 {"flash": "xxx", "pro": "xxx", "thinking": "xxx"}
             debug: 是否打印调试信息
-            http_proxy: HTTP 代理地址 (可选，格式: http://127.0.0.1:7890)
-            https_proxy: HTTPS 代理地址 (可选，格式: http://127.0.0.1:7890)
+            media_base_url: 媒体文件的基础 URL (如 http://localhost:8000)，用于构建完整的媒体访问 URL
         """
         self.secure_1psid = secure_1psid
         self.secure_1psidts = secure_1psidts
@@ -134,6 +130,7 @@ class GeminiClient:
         self.bl = bl
         self.push_id = push_id
         self.debug = debug
+        self.media_base_url = media_base_url or ""
         
         # 模型 ID 映射 (用于请求头选择模型)
         self.model_ids = model_ids or {
@@ -142,73 +139,15 @@ class GeminiClient:
             "thinking": "e051ce1aa80aa576",
         }
         
-        # 配置 SSL 上下文，解决 SSL 握手失败问题
-        # 尝试创建更宽松的 SSL 上下文
-        try:
-            ssl_context = ssl.create_default_context()
-            # Python 3.10+ 支持 TLSVersion，3.9 不支持
-            try:
-                ssl_context.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
-                ssl_context.maximum_version = ssl.TLSVersion.MAXIMUM_SUPPORTED
-            except AttributeError:
-                # Python 3.9 不支持 TLSVersion，使用默认设置
-                pass
-            # 设置 SSL 选项
-            ssl_context.check_hostname = True
-            ssl_context.verify_mode = ssl.CERT_REQUIRED
-            # 尝试设置更宽松的密码套件（如果方法存在）
-            try:
-                ssl_context.set_ciphers('DEFAULT:@SECLEVEL=1')
-            except (AttributeError, ssl.SSLError):
-                # 如果方法不存在或设置失败，使用默认值
-                pass
-        except Exception:
-            # 如果 SSL 配置失败，使用默认配置
-            ssl_context = True
+        # 配置代理：从环境变量读取 HTTP_PROXY/HTTPS_PROXY
+        # 或手动设置代理 URL（如 http://127.0.0.1:7890）
+        import os
+        proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("https_proxy") or os.environ.get("http_proxy")
         
-        # 配置代理
-        proxies = None
-        if http_proxy or https_proxy:
-            # 优先使用传入的代理参数
-            proxies = {}
-            if http_proxy:
-                proxies["http://"] = http_proxy
-            if https_proxy:
-                proxies["https://"] = https_proxy
-        elif os.environ.get("DISABLE_PROXY") != "1":
-            # 如果没有传入代理，检查环境变量（向后兼容）
-            http_env = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
-            https_env = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-            if http_env or https_env:
-                proxies = {}
-                if http_env:
-                    proxies["http://"] = http_env
-                if https_env:
-                    proxies["https://"] = https_env
-        
-        # 如果代理有问题，可以通过设置环境变量 DISABLE_PROXY=1 来临时清除代理环境变量
-        if os.environ.get("DISABLE_PROXY") == "1":
-            # 临时清除代理环境变量（仅对当前进程有效）
-            os.environ.pop("HTTP_PROXY", None)
-            os.environ.pop("HTTPS_PROXY", None)
-            os.environ.pop("http_proxy", None)
-            os.environ.pop("https_proxy", None)
-            proxies = None  # 禁用代理
-            if self.debug:
-                print("[INFO] 代理已禁用")
-        
-        # 如果 SSL 验证仍然有问题，可以通过环境变量 DISABLE_SSL_VERIFY=1 来禁用（不推荐，仅用于测试）
-        verify_ssl = ssl_context
-        if os.environ.get("DISABLE_SSL_VERIFY") == "1":
-            verify_ssl = False
-            if self.debug:
-                print("[WARNING] SSL 验证已禁用，仅用于测试！")
-        
-        # 构建 httpx.Client 的参数
+        # 创建 httpx 客户端，启用环境变量代理支持
         client_kwargs = {
             "timeout": 1220.0,
             "follow_redirects": True,
-            "verify": verify_ssl,
             "headers": {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
@@ -216,15 +155,14 @@ class GeminiClient:
                 "Referer": f"{self.BASE_URL}/",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             },
+            "trust_env": True,  # 自动读取系统代理环境变量
         }
         
-        # 如果配置了代理，添加到参数中
-        # httpx 使用 proxy 参数（单数），可以传递字符串或字典
-        if proxies:
-            # 优先使用 HTTPS 代理，如果没有则使用 HTTP 代理
-            proxy_url = proxies.get("https://") or proxies.get("http://")
-            if proxy_url:
-                client_kwargs["proxy"] = proxy_url
+        # 如果检测到代理，显式配置（避免某些环境下 trust_env 不生效）
+        if proxy_url:
+            client_kwargs["proxy"] = proxy_url
+            if self.debug:
+                print(f"[DEBUG] 使用代理: {proxy_url}")
         
         self.session = httpx.Client(**client_kwargs)
         
@@ -631,9 +569,35 @@ class GeminiClient:
     def _parse_response(self, response_text: str) -> str:
         """解析响应文本 - 修复版"""
         try:
+            # 首先检查是否有 Bard 错误信息
+            if "BardErrorInfo" in response_text:
+                # 提取错误码
+                error_match = re.search(r'BardErrorInfo["\s,\[\]]+\[(\d+)\]', response_text)
+                error_code = error_match.group(1) if error_match else "未知"
+                
+                # 错误码含义映射
+                error_messages = {
+                    "1052": "AT Token (SNLM0E) 已过期或无效",
+                    "1053": "请求被拒绝，可能是 Cookie 过期",
+                    "1054": "会话已过期",
+                    "1055": "请求频率过高",
+                }
+                error_desc = error_messages.get(error_code, f"未知错误码 {error_code}")
+                
+                raise CookieExpiredError(
+                    f"Gemini 返回错误: {error_desc}\n"
+                    f"请重新获取 AT Token (SNLM0E):\n"
+                    f"1. 打开 https://gemini.google.com 并登录\n"
+                    f"2. 按 F12 打开开发者工具\n"
+                    f"3. 在 Console 中输入: document.body.innerHTML.match(/SNlM0e\":\"([^\"]+)\"/)[1]\n"
+                    f"4. 复制输出的值，更新到后台配置的 AT Token 字段"
+                )
+            
             # 跳过前缀并按行解析
             lines = response_text.split("\n")
             final_text = ""
+            generated_images_set = set()  # 使用 set 全局去重
+            last_inner_json = None  # 保存最后一个有效的 inner_json 用于调试
             
             for line in lines:
                 line = line.strip()
@@ -652,6 +616,16 @@ class GeminiClient:
                         # 检查是否是 wrb.fr 响应
                         if len(actual_data) >= 3 and actual_data[0] == "wrb.fr" and actual_data[2]:
                             inner_json = json.loads(actual_data[2])
+                            last_inner_json = inner_json
+                            
+                            # 尝试提取生成的图片 URL，合并到全局 set 中去重
+                            imgs = self._extract_generated_images(inner_json)
+                            if imgs:
+                                for img in imgs:
+                                    generated_images_set.add(img)
+                                if self.debug:
+                                    print(f"[DEBUG] 从响应中提取到 {len(imgs)} 个图片 URL，当前总数: {len(generated_images_set)}")
+                            
                             # 提取文本内容
                             if inner_json and len(inner_json) > 4 and inner_json[4]:
                                 candidates = inner_json[4]
@@ -672,18 +646,281 @@ class GeminiClient:
                                             if len(candidate) > 0:
                                                 self.choice_id = candidate[0] or self.choice_id
                 except Exception as e:
+                    if self.debug:
+                        print(f"[DEBUG] 解析行时出错: {e}")
                     continue
             
+            # 转换为列表
+            generated_images = list(generated_images_set)
+            
+            if self.debug:
+                print(f"[DEBUG] 解析完成: final_text长度={len(final_text)}, 图片数量={len(generated_images)}")
+            
+            # 处理生成的图片/视频 - 下载并缓存到本地
+            if generated_images:
+                if self.debug:
+                    print(f"[DEBUG] 提取到 {len(generated_images)} 个媒体 URL，开始下载...")
+                
+                # 下载图片并获取本地代理 URL
+                local_media_urls = []
+                for i, url in enumerate(generated_images):
+                    if self.debug:
+                        print(f"[DEBUG] 下载媒体 {i+1}/{len(generated_images)}: {url[:80]}...")
+                    local_url = self._download_media_as_data_url(url)
+                    if local_url:
+                        local_media_urls.append(local_url)
+                        if self.debug:
+                            print(f"[DEBUG] 媒体 {i+1} 下载成功: {local_url}")
+                    else:
+                        # 下载失败，使用原始 URL
+                        local_media_urls.append(url)
+                        if self.debug:
+                            print(f"[DEBUG] 媒体 {i+1} 下载失败，使用原始 URL")
+                
+                # 检测占位符（如果有文本的话）
+                has_placeholder = False
+                if final_text:
+                    has_placeholder = ('image_generation_content' in final_text or 
+                                       'video_gen_chip' in final_text)
+                
+                # 构建包含本地代理 URL 的响应
+                media_parts = []
+                for i, url in enumerate(local_media_urls):
+                    media_parts.append(f"![生成的内容 {i+1}]({url})")
+                
+                media_text = "\n\n".join(media_parts)
+                
+                if has_placeholder:
+                    # 移除占位符 URL
+                    cleaned_text = re.sub(r'https?://googleusercontent\.com/(?:image_generation_content|video_gen_chip)/\d+', '', final_text)
+                    cleaned_text = re.sub(r'http://googleusercontent\.com/(?:image_generation_content|video_gen_chip)/\d+', '', cleaned_text)
+                    cleaned_text = re.sub(r'!\[.*?\]\(\)', '', cleaned_text)  # 移除空的图片标记
+                    cleaned_text = cleaned_text.strip()
+                    if cleaned_text:
+                        final_text = cleaned_text + "\n\n" + media_text
+                    else:
+                        final_text = media_text
+                elif final_text:
+                    # 有文本但没有占位符，追加图片
+                    final_text = final_text + "\n\n" + media_text
+                else:
+                    # 没有文本，只有图片
+                    final_text = media_text
+                
+                if self.debug:
+                    print(f"[DEBUG] 媒体处理完成，成功下载 {len([u for u in local_media_urls if u.startswith('/media/')])} 个")
+            
+            # 检测视频生成占位符，替换为提示文案
+            is_video_generation = False
+            if final_text and 'video_gen_chip' in final_text:
+                is_video_generation = True
+            
+            # 清理文本中的占位符 URL 和用户上传图片的 URL
             if final_text:
-                # 优化图片 URL 为原始高清尺寸
+                # 清理占位符 URL
+                final_text = re.sub(r'https?://googleusercontent\.com/(?:image_generation_content|video_gen_chip)/\d+\s*', '', final_text)
+                final_text = re.sub(r'http://googleusercontent\.com/(?:image_generation_content|video_gen_chip)/\d+\s*', '', final_text)
+                # 清理用户上传图片的 URL（/gg/ 路径，非 /gg-dl/）
+                final_text = re.sub(r'!\[[^\]]*\]\(https://[^)]*googleusercontent\.com/gg/[^)]+\)', '', final_text)
+                final_text = re.sub(r'https://lh3\.googleusercontent\.com/gg/[^\s\)]+', '', final_text)
+                final_text = final_text.strip()
+            
+            # 如果是视频生成，添加提示文案
+            if is_video_generation:
+                video_notice = "\n\n---\n📹 视频为异步生成，生成结果可在官网聊天窗口查看下载。\n\n⏱️ 使用限制：\n- 视频生成 (Veo 模型)：每天总共可以生成 3 次\n- 图片生成 (Nano Banana 模型)：每天总共可以生成 1000 次"
+                if final_text:
+                    final_text = final_text + video_notice
+                else:
+                    final_text = video_notice.strip()
+            
+            if final_text:
+                # 优化图片 URL 为原始高清尺寸（仅对未下载的原始 URL）
                 final_text = self._optimize_image_urls(final_text)
                 return final_text
+            
+            # 如果没有文本也没有图片，尝试从 last_inner_json 中提取更多信息
+            if self.debug and last_inner_json:
+                print(f"[DEBUG] 无法提取内容，inner_json 结构: {str(last_inner_json)[:500]}...")
                 
         except Exception as e:
             if self.debug:
                 print(f"[DEBUG] 解析错误: {e}")
         
         return "无法解析响应"
+    
+    def _extract_generated_media(self, data: Any, depth: int = 0) -> List[str]:
+        """从响应数据中递归提取生成的图片/视频 URL
+        
+        Gemini 会返回两个媒体（带水印和不带水印），我们只保留最后一个（不带水印）
+        只提取 AI 生成的媒体 (/gg-dl/ 路径)，不提取用户上传的图片 (/gg/ 路径)
+        """
+        if depth > 30:  # 防止无限递归
+            return []
+        
+        media_urls = []
+        
+        if isinstance(data, list):
+            # 检查是否是媒体对结构: [[null, 1, "file1.png/mp4", "url1", ...], null, null, [null, 1, "file2.png/mp4", "url2", ...]]
+            # 第一个是带水印的，第二个是不带水印的
+            if (len(data) >= 1 and 
+                isinstance(data[0], list) and len(data[0]) >= 4 and
+                data[0][0] is None and 
+                isinstance(data[0][1], int) and
+                isinstance(data[0][2], str) and
+                isinstance(data[0][3], str) and 
+                data[0][3].startswith('https://') and
+                'gg-dl/' in data[0][3]):  # 只匹配 AI 生成的媒体
+                # 尝试找第二个媒体（不带水印）
+                second_url = None
+                if len(data) >= 4 and isinstance(data[3], list) and len(data[3]) >= 4:
+                    if (data[3][0] is None and 
+                        isinstance(data[3][3], str) and 
+                        'gg-dl/' in data[3][3]):
+                        second_url = data[3][3]
+                
+                # 优先使用第二个，否则用第一个
+                url = second_url if second_url else data[0][3]
+                if 'image_generation_content' not in url and 'video_gen_chip' not in url:
+                    media_urls.append(url)
+                    return media_urls
+            
+            # 检查是否是单个媒体数据结构: [null, 1, "filename.png/mp4", "https://...gg-dl/..."]
+            if (len(data) >= 4 and 
+                data[0] is None and 
+                isinstance(data[1], int) and
+                isinstance(data[2], str) and 
+                isinstance(data[3], str) and 
+                data[3].startswith('https://') and
+                'gg-dl/' in data[3]):  # 只匹配 AI 生成的媒体
+                url = data[3]
+                if 'image_generation_content' not in url and 'video_gen_chip' not in url:
+                    media_urls.append(url)
+                    return media_urls
+            
+            # 递归搜索，收集所有媒体 URL
+            all_found = []
+            for item in data:
+                found = self._extract_generated_media(item, depth + 1)
+                if found:
+                    all_found.extend(found)
+            
+            # 如果找到多个，返回最后一个（通常是不带水印的）
+            if all_found:
+                seen = set()
+                unique = []
+                for u in all_found:
+                    if u not in seen:
+                        seen.add(u)
+                        unique.append(u)
+                # 返回最后一个（不带水印）
+                return [unique[-1]] if unique else []
+                
+        elif isinstance(data, dict):
+            for value in data.values():
+                found = self._extract_generated_media(value, depth + 1)
+                if found:
+                    return found
+        
+        return media_urls
+    
+    # 保持向后兼容
+    def _extract_generated_images(self, data: Any, depth: int = 0) -> List[str]:
+        """向后兼容的别名"""
+        return self._extract_generated_media(data, depth)
+    
+    def _download_media_as_data_url(self, url: str) -> str:
+        """下载媒体文件并保存到本地缓存，返回本地代理 URL
+        
+        Args:
+            url: 媒体文件的 URL
+            
+        Returns:
+            str: 本地代理 URL 或 base64 data URL
+                 下载失败时返回空字符串
+        """
+        try:
+            # 先优化 URL 获取高清原图（仅对图片）
+            if ("googleusercontent" in url or "ggpht" in url) and not any(ext in url.lower() for ext in ['.mp4', '.webm', 'video']):
+                # 移除现有尺寸参数，添加原始尺寸参数 =s0
+                url = re.sub(r'=w\d+(-h\d+)?(-[a-zA-Z]+)*$', '=s0', url)
+                url = re.sub(r'=s\d+(-[a-zA-Z]+)*$', '=s0', url)
+                url = re.sub(r'=h\d+(-[a-zA-Z]+)*$', '=s0', url)
+                # 如果 URL 没有尺寸参数，添加 =s0
+                if not url.endswith('=s0') and '=' not in url.split('/')[-1]:
+                    url += '=s0'
+            
+            if self.debug:
+                print(f"[DEBUG] 正在下载媒体 (高清): {url[:100]}...")
+            
+            # 使用当前会话下载（带认证 cookies）
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Referer": "https://gemini.google.com/",
+            }
+            resp = self.session.get(url, timeout=60.0, headers=headers)
+            
+            if self.debug:
+                print(f"[DEBUG] 下载状态: {resp.status_code}, 大小: {len(resp.content)} bytes")
+            
+            if resp.status_code != 200:
+                if self.debug:
+                    print(f"[DEBUG] 下载媒体失败: HTTP {resp.status_code}")
+                return ""
+            
+            # 检查内容是否为空或太小（可能是错误页面）
+            if len(resp.content) < 100:
+                if self.debug:
+                    print(f"[DEBUG] 下载内容太小，可能是错误: {resp.content[:100]}")
+                return ""
+            
+            # 根据内容检测文件类型
+            content = resp.content
+            if content[:8] == b'\x89PNG\r\n\x1a\n':
+                ext = ".png"
+                mime = "image/png"
+            elif content[:3] == b'\xff\xd8\xff':
+                ext = ".jpg"
+                mime = "image/jpeg"
+            elif content[:6] in (b'GIF87a', b'GIF89a'):
+                ext = ".gif"
+                mime = "image/gif"
+            elif content[:4] == b'RIFF' and content[8:12] == b'WEBP':
+                ext = ".webp"
+                mime = "image/webp"
+            elif content[4:8] == b'ftyp' or content[:4] == b'\x00\x00\x00\x1c':
+                ext = ".mp4"
+                mime = "video/mp4"
+            else:
+                ext = ".png"
+                mime = "image/png"
+            
+            # 生成唯一文件名
+            import os
+            media_id = f"gen_{uuid.uuid4().hex[:16]}"
+            
+            # 保存到缓存目录
+            cache_dir = os.path.join(os.path.dirname(__file__), "media_cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            file_path = os.path.join(cache_dir, media_id + ext)
+            
+            with open(file_path, "wb") as f:
+                f.write(content)
+            
+            if self.debug:
+                print(f"[DEBUG] 媒体已保存: {file_path}")
+            
+            # 返回完整的媒体访问 URL
+            media_path = f"/media/{media_id}"
+            if self.media_base_url:
+                return f"{self.media_base_url}{media_path}"
+            return media_path
+            
+        except Exception as e:
+            if self.debug:
+                print(f"[DEBUG] 下载媒体异常: {e}")
+            return ""
     
     def _optimize_image_urls(self, text: str) -> str:
         """优化文本中的 Google 图片 URL 为原始高清尺寸
@@ -951,11 +1188,10 @@ class GeminiClient:
                 if self.debug:
                     print(f"[DEBUG] 响应状态: {resp.status_code}")
                     print(f"[DEBUG] 响应内容前500字符: {resp.text[:500]}")
-                    if image_paths:
-                        # 保存完整响应用于调试
-                        with open("debug_image_response.txt", "w", encoding="utf-8") as f:
-                            f.write(resp.text)
-                        print(f"[DEBUG] 完整响应已保存到 debug_image_response.txt")
+                    # 始终保存完整响应用于调试
+                    with open("debug_image_response.txt", "w", encoding="utf-8") as f:
+                        f.write(resp.text)
+                    print(f"[DEBUG] 完整响应已保存到 debug_image_response.txt")
                 
                 # 记录 Gemini 完整响应
                 self._log_gemini_call(gemini_request_log, resp.text)
@@ -999,7 +1235,22 @@ class GeminiClient:
                     time.sleep(wait_time)
                     continue
                 self._log_gemini_call(gemini_request_log, "", error=str(e))
-                raise Exception(f"网络连接失败（已重试{max_retries}次）: {e}")
+                
+                # 构建友好的错误提示
+                error_msg = f"网络连接失败（已重试{max_retries}次）: {e}"
+                proxy_hint = (
+                    "\n\n💡 可能的原因及解决方案：\n"
+                    "1. 未配置代理 - 中国大陆需要代理才能访问 Gemini\n"
+                    "   设置环境变量后重启程序：\n"
+                    "   • Windows CMD:    set HTTPS_PROXY=http://127.0.0.1:7890\n"
+                    "   • Windows PowerShell: $env:HTTPS_PROXY=\"http://127.0.0.1:7890\"\n"
+                    "   • Linux/Mac:      export HTTPS_PROXY=http://127.0.0.1:7890\n"
+                    "   （请将 7890 替换为你的代理端口）\n\n"
+                    "2. 代理软件未开启 - 请确保 Clash/V2Ray 等代理软件正在运行\n\n"
+                    "3. 代理模式问题 - 建议使用「系统代理」或「TUN 模式」\n\n"
+                    "4. SSL 证书问题 - 部分代理可能导致 SSL 握手失败"
+                )
+                raise Exception(error_msg + proxy_hint)
             except Exception as e:
                 self._log_gemini_call(gemini_request_log, "", error=str(e))
                 raise Exception(f"请求失败: {e}")
